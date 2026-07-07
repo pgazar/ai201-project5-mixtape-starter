@@ -2,7 +2,7 @@
 
 ## AI Usage
 
-_(To be filled in after Milestones 2–4 — will describe specifically how Claude was used for navigation, tracing, and verification during this project, and where I overrode or double-checked its output.)_
+_(To be filled in after Milestone 4 — will describe specifically how Claude was used for navigation, tracing, and verification during this project, and where I overrode or double-checked its output.)_
 
 ---
 
@@ -11,17 +11,17 @@ _(To be filled in after Milestones 2–4 — will describe specifically how Clau
 ### Main files and their roles
 
 - **`app.py`** — Flask application factory (`create_app`). Initializes the SQLAlchemy `db` instance, configures the SQLite database (`sqlite:///mixtape.db` by default), registers all four blueprints (`songs`, `playlists`, `users`, `feed`), and calls `db.create_all()` on startup.
-- **`models.py`** — Defines all SQLAlchemy models: `User`, `Tag`, `Song`, `ListeningEvent`, `Rating`, `Playlist`, `Notification`, plus three association tables: `friendships` (symmetric many-to-many), `song_tags` (many-to-many), and `playlist_entries` (many-to-many **with an explicit `position` column** — songs in a playlist have an ordered slot, not just insertion order). Every `DateTime` column defaults to `datetime.now(timezone.utc)` — timezone-aware at write time, which matters because SQLite does not natively preserve timezone info on round-trip (flagged as a hypothesis for Issue #2, unverified as of this point).
+- **`models.py`** — Defines all SQLAlchemy models: `User`, `Tag`, `Song`, `ListeningEvent`, `Rating`, `Playlist`, `Notification`, plus three association tables: `friendships` (symmetric many-to-many), `song_tags` (many-to-many), and `playlist_entries` (many-to-many **with an explicit `position` column** — songs in a playlist have an ordered slot, not just insertion order). Every `DateTime` column defaults to `datetime.now(timezone.utc)` — timezone-aware at write time, which matters because SQLite does not natively preserve timezone info on round-trip (flagged as a hypothesis for Issue #2 during orientation; later disproved by direct testing — see Issue #2 RCA below).
 - **`routes/songs.py`** — Song search (`GET /songs/search`), song detail (`GET /songs/<id>`), rating (`POST /songs/<id>/rate`), and listening (`POST /songs/<id>/listen`). Delegates to `search_service` and `notification_service.rate_song` and `streak_service.record_listening_event`.
 - **`routes/playlists.py`** — Playlist creation, detail, song listing, and adding a song to a playlist. Delegates to `playlist_service` and `notification_service.add_to_playlist`.
 - **`routes/users.py`** — User detail, streak lookup, notification listing, and marking a notification read. Delegates to `streak_service.get_streak` and `notification_service`.
 - **`routes/feed.py`** — "Friends listening now" and general activity feed. Delegates entirely to `feed_service`.
 - **`services/streak_service.py`** — Owns listening-streak logic: `record_listening_event` (logs a `ListeningEvent`, then calls `update_listening_streak`), `update_listening_streak` (increments/resets the streak based on days since last listen), `get_streak`.
-- **`services/feed_service.py`** — `get_friends_listening_now` (friends who listened within the last 24h, one most-recent song per friend) and `get_activity_feed` (last N friend events, no recency filter).
+- **`services/feed_service.py`** — `get_friends_listening_now` (friends who listened within the recency window, one most-recent song per friend) and `get_activity_feed` (last N friend events, no recency filter).
 - **`services/search_service.py`** — `search_songs` (case-insensitive title/artist match, outer-joined to tags) and `get_song`.
-- **`services/notification_service.py`** — `create_notification` (low-level insert), `add_to_playlist` (adds song to playlist + notifies original sharer), `rate_song` (upserts a rating — **does not create a notification**), `get_notifications`, `mark_as_read`.
-- **`services/playlist_service.py`** — `create_playlist`, `get_playlist_songs` (songs ordered by `position` — currently sliced with `[:-1]`, dropping the last song), `get_playlist`, `get_user_playlists`.
-- **`seed_data.py`** — Populates the DB with test users/songs/playlists for local development.
+- **`services/notification_service.py`** — `create_notification` (low-level insert), `add_to_playlist` (adds song to playlist + notifies original sharer), `rate_song` (upserts a rating), `get_notifications`, `mark_as_read`.
+- **`services/playlist_service.py`** — `create_playlist`, `get_playlist_songs` (songs ordered by `position`), `get_playlist`, `get_user_playlists`.
+- **`seed_data.py`** — Populates the DB with test users/songs/playlists for local development. Several entries are deliberately constructed to expose specific issues (documented inline).
 - **`tests/`** — Existing pytest coverage for playlists, search, and streaks (`test_playlists.py`, `test_search.py`, `test_streaks.py`).
 
 ### Pattern noticed
@@ -32,11 +32,11 @@ Every route file does **only** two things: parse the incoming request (JSON body
 
 `POST /songs/<song_id>/rate` (`routes/songs.py`) parses `user_id` and `score` from the JSON body → calls `notification_service.rate_song(user_id, song_id, score)` → which validates `1 <= score <= 5`, looks up the `Song` and `User`, checks for an existing `Rating` (upsert via the `unique_user_song_rating` constraint on `user_id`+`song_id`), commits, and returns the `Rating`. The route serializes it back with `.to_dict()`.
 
-Notably, `rate_song()` has no call to `create_notification()` anywhere — compared line-by-line against `add_to_playlist()` (same file), which *does* end with a `create_notification(...)` call to notify the song's original sharer. Both functions represent "a friend interacted with your shared song," but only one of the two paths actually creates a `Notification` row. This is the architectural gap behind Issue #4.
+Notably, `rate_song()` originally had no call to `create_notification()` anywhere — compared line-by-line against `add_to_playlist()` (same file), which *does* end with a `create_notification(...)` call to notify the song's original sharer. Both functions represent "a friend interacted with your shared song," but only one of the two paths actually created a `Notification` row. This was the architectural gap behind Issue #4 (fixed — see RCA below).
 
 ### Data flow — Example 2: a user views a playlist's songs
 
-`GET /playlists/<playlist_id>/songs` (`routes/playlists.py`) → `playlist_service.get_playlist_songs(playlist_id)` → joins `Song` to the `playlist_entries` association table on `playlist_id`, orders ascending by the `position` column, then returns the list. The current implementation slices the result with `songs[:-1]` before converting to dicts — this drops whatever song is last in position order, regardless of playlist size. This is the suspected root cause of Issue #5, to be confirmed by reproduction before fixing.
+`GET /playlists/<playlist_id>/songs` (`routes/playlists.py`) → `playlist_service.get_playlist_songs(playlist_id)` → joins `Song` to the `playlist_entries` association table on `playlist_id`, orders ascending by the `position` column, then returns the list. The original implementation sliced the result with `songs[:-1]` before converting to dicts — dropping whatever song was last in position order, regardless of playlist size. This was the root cause of Issue #5 (fixed — see RCA below).
 
 ### Five open issues (from `README.md`)
 
@@ -60,7 +60,7 @@ Notably, `rate_song()` has no call to `create_notification()` anywhere — compa
 
 **The root cause:** Python's `datetime.weekday()` returns `6` for Sunday. The condition `days_since_last == 1 and today.weekday() != 6` correctly detects a consecutive-day listen, but then additionally requires that the *current* day not be a Sunday before incrementing. Because of this, every single time a user's consecutive listening streak crossed into a Sunday, the code fell through to the `else` branch and reset the streak to `1`, even though the user had listened on back-to-back days exactly as the streak is supposed to reward. This explains the user-reported symptom ("keeps resetting") — it wasn't intermittent, it was guaranteed to happen once a week for every active listener.
 
-**My fix and side-effect check:** Removed the `and today.weekday() != 6` clause entirely, leaving `elif days_since_last == 1:`. This restores the exact rule stated in the docstring, with no day-of-week exception. Verified in a fresh `flask shell` session (module caching had briefly given a false negative on the first re-test — resolved by restarting the shell so the edited file was actually re-imported): Saturday→Sunday consecutive listen now correctly goes `5 → 6`. Also checked the "skip a day" boundary (`last_listened_at` set 3 days prior) — correctly resets to `1`, confirming that branch was untouched by the fix. The "already listened today" (`days_since_last == 0`) no-op branch was not modified by this change and was not re-verified after the fix — noting this as an outstanding check before final submission, since the assignment asks to verify both sides of a boundary condition.
+**My fix and side-effect check:** Removed the `and today.weekday() != 6` clause entirely, leaving `elif days_since_last == 1:`. This restores the exact rule stated in the docstring, with no day-of-week exception. Verified in a fresh `flask shell` session (module caching had briefly given a false negative on the first re-test — resolved by restarting the shell so the edited file was actually re-imported): Saturday→Sunday consecutive listen now correctly goes `5 → 6`. Also checked the "skip a day" boundary (`last_listened_at` set 3 days prior) — correctly resets to `1`, confirming that branch was untouched by the fix. The "already listened today" (`days_since_last == 0`) no-op branch was not modified by this change; re-verification of that specific branch after the fix was not completed and is noted here as an outstanding check.
 
 ### Issue #2: Friends Listening Now shows people from yesterday
 
@@ -70,7 +70,7 @@ Notably, `rate_song()` has no call to `create_notification()` anywhere — compa
 
 **The root cause:** `RECENT_THRESHOLD` was set to `timedelta(hours=24)`, but a "Friends Listening Now" / live-presence feed is meant to reflect near-real-time activity, not a full day of history. The query logic and filter mechanics were correct throughout — verified independently by running the exact filter by hand and confirming it matched the constant it was given. The bug was purely in the threshold *value*, not the comparison logic: 24 hours is wide enough that a friend's listening session from many hours earlier (which a user would describe as "yesterday") is incorrectly presented as if it's happening right now.
 
-**My fix and side-effect check:** Changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(minutes=30)`. Verified both boundary directions in a single controlled session: (1) `kenji`'s feed — whose only two friend-events are 2 hours and 34 hours old — correctly returns `[]` after the fix; (2) `nova`'s feed — whose three friends each have events 10–20 minutes old — correctly returns all three friends with their timestamps. Confirmed `get_activity_feed()` (the unfiltered activity feed) was not touched by this change, since it intentionally has no recency filter by design per its own docstring — verified I did not need to and did not modify that function.
+**My fix and side-effect check:** Changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(minutes=30)`. Verified both boundary directions in a single controlled session: (1) `kenji`'s feed — whose only two friend-events are 2 hours and 34 hours old — correctly returns `[]` after the fix; (2) `nova`'s feed — whose three friends each have events 10–20 minutes old — correctly returns all three friends with their timestamps. Confirmed `get_activity_feed()` (the unfiltered activity feed) was not touched by this change, since it intentionally has no recency filter by design per its own docstring.
 
 ### Issue #3: The same song keeps showing up twice in search
 
@@ -82,8 +82,6 @@ Notably, `rate_song()` has no call to `create_notification()` anywhere — compa
 
 **My fix and side-effect check:** Added `.distinct()` to the query in `search_songs()`, immediately after the `.filter(...)` clause. This makes the query explicitly safe against duplicate rows from the one-to-many join, rather than depending on an implicit, version-specific ORM behavior that happens to hide the problem today but isn't guaranteed to in a different SQLAlchemy version or query style. Verified: (1) a raw `SELECT DISTINCT` reference query for the same search condition returns `1` unique song ID, matching (2) `search_songs("Crown Heights")` returning exactly `1` result after the fix, and (3) a broad search (`search_songs("a")`) returns `13` results — matching the total number of seeded songs exactly, confirming `.distinct()` did not drop any legitimate results.
 
-_(Additional entries to be added for Issue #5 as we work through it.)_
-
 ### Issue #4: No notification when a friend rates my song
 
 **How I reproduced it:** During codebase orientation, I compared `rate_song()` against `add_to_playlist()` in the same file and noticed `add_to_playlist()` ends with a `create_notification(...)` call while `rate_song()` has no equivalent. Confirmed with a live reproduction: found a song shared by `nova`, recorded `nova`'s notification count, called `rate_song(darius.id, song.id, 4)` (darius rating nova's song), and re-checked the count. Count stayed identical (`1 → 1` in the first pass) — rating a friend's song creates zero notifications for the sharer.
@@ -94,4 +92,16 @@ _(Additional entries to be added for Issue #5 as we work through it.)_
 
 **My fix and side-effect check:** Added a `create_notification()` call at the end of `rate_song()`, after the existing `db.session.commit()`, mirroring `add_to_playlist()`'s exact pattern: guard against self-notification (`if song.shared_by != user_id`), notification type `"song_rated"` (matching the type already documented in the module docstring), and a body message following the same phrasing style ("{rater} rated your song '{title}' {score}/5."). Verified two cases in the same session: (1) `darius` rating `nova`'s song correctly created a `song_rated` notification for `nova`, with the correct body text; (2) `nova` rating her own song correctly did **not** create a self-notification (count unchanged, `2 → 2`), confirming the guard condition works the same way it does in the existing `add_to_playlist()` path. Did not modify `add_to_playlist()`, `create_notification()`, or any other function in the file.
 
-_(Additional entries to be added for Issue #5 as we work through it.)_
+### Issue #5: The last song in a playlist never shows up
+
+**How I reproduced it:** Queried a real seeded playlist ("Late Night Vibes", 7 songs) two ways in the same `flask shell` session: once via the raw SQLAlchemy join/order-by directly against `playlist_entries` (the ground truth — 7 songs, ending in "Free Throws"), and once via the actual `get_playlist_songs()` function. The function returned only 6 songs, missing "Free Throws" — the last song by `position`.
+
+**How I found the root cause:** Spotted during codebase orientation, before any reproduction: `get_playlist_songs()` builds the songs query correctly (joined to `playlist_entries`, ordered ascending by `position`), but the return statement was `[song.to_dict() for song in songs[:-1]]` — slicing off the last element of an already-correct, correctly-ordered list. The function's own docstring includes the line "Note: This function returns all songs in the playlist," which directly contradicts what the code did, confirming this was an unintentional defect rather than a documented design choice.
+
+**The root cause:** The query itself has no bug — it fetches and orders every song in the playlist correctly. The bug was purely in the final line, where `songs[:-1]` discarded the last item of the result list before converting to dicts, regardless of playlist size. This dropped the last song by `position` from every playlist, every time, independent of how many songs the playlist has.
+
+**My fix and side-effect check:** Changed `songs[:-1]` to `songs`, removing the slice entirely so the full, correctly-ordered query result is returned as-is. Verified two cases in a single fresh session: (1) the 7-song playlist now returns all 7 songs, ending correctly with "Free Throws"; (2) a boundary case specifically built to stress-test this fix — a playlist with exactly **one** song — now correctly returns `1` song. This boundary case matters because under the old `[:-1]` logic, a single-song playlist would have returned an **empty list**, not just a list short by one — slicing "everything but the last" off a one-item list leaves nothing. Did not modify `get_playlist()` or `get_user_playlists()`, and did not need to — neither touches the `songs[:-1]` line.
+
+---
+
+_(All five issues fixed and documented. Regression tests and final AI usage writeup pending — Milestone 4.)_
